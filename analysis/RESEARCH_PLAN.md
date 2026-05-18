@@ -15,9 +15,13 @@
 - 基因组在线性染色体上的**局部结构约束**
 - 少数关键 regulator 对大规模表达变化的**稀疏支配作用**
 
-因此，本研究提出 **Hayat**，通过显式分解表达生成过程，将基因表达建模为：
+因此，本研究提出 **Hayat**，一个 Open-Then-Express 结构因果模型（SCM）：
 
-> **基因表达 = 顺式染色质上下文 × 反式调控因子调制**
+> **基因表达 = gate × drive**
+> - **gate（cis 门控）**：该基因在此细胞中是否"开放"可表达
+> - **drive（trans 驱动）**：在开放的前提下，表达被推到多高
+>
+> 模型不引入 TF motif、GRN 先验或 ATAC 数据——所有参数从表达数据中学习，仅通过结构正则（稀疏性、gate 二值化、program 去相关）推动 cis/trans 分化。
 
 并通过公共表达数据、公共扰动数据、公共 TF 知识库以及公共 10x Multiome PBMC 配对 RNA+ATAC 数据，对该结构假设进行系统验证。
 
@@ -27,14 +31,14 @@
 
 ### 总体生物学假设
 
-> 基因表达由 cis 与 trans 两类调控机制共同决定；其中 cis 提供局部表达背景，trans 对 cis 状态进行条件性调制。
+> 基因表达由两个可分离的机制决定：cis 控制"能否表达"（gate），trans 控制"表达多少"（drive）。gate 关闭时，trans 再强也无法驱动表达。
 
-### 模型假设
+### 模型假设（SCM 结构方程）
 
-- **H1**：按染色体分块建模的 cis 分支能更好学习同染色体局部依赖；
-- **H2**：稀疏 regulator gate 的 trans 分支能自动识别少量关键调控因子；
-- **H3**：乘性融合 `cis_out * (1 + tanh(trans_out))` 比简单相加更符合"trans 调制 cis"的调控逻辑；
-- **H4**：Hayat 的 cis/trans 表征可被独立公共多组学数据支持，即 cis 对应开放染色质，trans 对应调控因子驱动与跨染色体传播。
+- **H1（Gate 假设）**：segment-level cis state `u_s` → per-gene gate `o_g` 能学到有意义的"开放/关闭"二值化模式，且 gate 与外部 promoter accessibility 一致；
+- **H2（Drive 假设）**：无先验 trans programs `z` 通过稀疏 gene loading `W` 驱动表达，能自动收敛到少数可解释的调控程序；
+- **H3（Hurdle 假设）**：`o * r` 的 hurdle 融合（gate 关闭 → 表达为零）比加法/软调制更符合"可及性是必要条件"的调控逻辑；
+- **H4（禁止边假设）**：模型故意禁止的因果边（z→gate, u→drive, c→gate, geneA→geneB）如果被加入会损害 gate 的 ATAC 一致性或 trans 的可解释性，说明这些禁止边是正确约束。
 
 ---
 
@@ -51,35 +55,64 @@
 - 是否与独立扰动数据中的强效 perturbation gene 一致？
 
 ### 目标 3：验证模型内部机制是否得到公共多组学支持
-- cis 表征是否与 promoter accessibility 一致？
-- trans 表征是否体现跨染色体调控流？
-- regulator-target 关系是否得到公共 TF target 先验支持？
+- gate 是否与 promoter accessibility 一致？
+- trans programs 是否与已知 TF regulon 一致？
+- gate × drive 的交互是否与独立扰动数据中的"可及性依赖的 perturbation 效应"一致？
 
 ---
 
-## 四、模型总体设计
+## 四、模型总体设计：Open-Then-Express SCM
 
-### 4.1 Cis 分支
-- 输入为按染色体和坐标排序的基因表达序列；
-- 根据 `chrom_boundaries` 对基因序列按染色体块切分；
-- 在每个块内使用**双向 Mamba2** 建模局部依赖；
-- 输出 `cis_out`，刻画局部顺式表达上下文。
+### 4.1 推断链（Encoder）
 
-### 4.2 Trans 分支
-- 对全基因表达先经过 **RegulatorGate MLP**；
-- 选择少量活跃 regulator；
-- 用轻量交互模块建模 regulator 对所有基因的全局调制；
-- 输出 `trans_out`，刻画反式调控强度。
+| 隐变量 | 输入 | 计算 | 语义 |
+|--------|------|------|------|
+| `u` [B,S,d_u] | per-segment pooled log(1+x) | MLP_u | segment cis-openness |
+| `h` [B,G,d_h] | per-gene log(1+x_g) | MLP_h (1→4) | gene self-signal |
+| `z` [B,K] | per-segment pooled log(1+x) | MLP_z | trans programs |
+| `c` [B,d_c] | global log(1+x) + scGPT embedding | MLP_c + proj(e_scGPT · x) | global cell state |
 
-### 4.3 融合方式
+关键约束：z 只看到 segment 级粗粒度信号（S=326），不接触 per-gene 数据。
+
+### 4.2 因果链（Decoder — 结构方程）
+
+**Gate（许可）**：
+```
+π_g = α_g + Γ_g · u_{s(g)} + γ_g · h_g
+o_g = GumbelSigmoid(π_g, τ)      → o_g ∈ [0,1]
+```
+
+**Drive（强度）**：
+```
+r_g = softplus(β_g + W_g · z + Λ_g · c)    → r_g ∈ [0,∞)
+```
+
+**Fusion（Hurdle）**：
+```
+μ_g = ℓ · (ε + (1-ε)· o_g) · r_g
+x̂_g ~ NB(μ_g, θ_g)
+```
+
+### 4.3 禁止边（模型核心声明）
+
+这些因果边被故意排除。每一条都是一个可检验的假设：
+
+| 禁止边 | 声明 | 检验方式 |
+|--------|------|----------|
+| z → gate | 调控程序不控制染色质开放 | 加 z→gate 边，检查 gate-ATAC 相关性是否下降 |
+| u → drive | 可及性只控制"能不能"，不控制"表达多少" | 加 u→drive 边，检查 gate/drive 语义是否模糊 |
+| c/scGPT → gate | 全局状态不绕过 cis 直接开门 | 加 c→gate 边，检查 gate 是否失去二值化 |
+| gene A → gene B | 基因间依赖由共享隐变量中介 | 加 direct edges，检查是否仅过拟合共表达 |
+
+### 4.4 结构正则（替代先验）
 
 ```
-total_out = cis_out * (1 + tanh(trans_out))
+稀疏性：  ‖W‖₁                  → 每个基因只被少数 program 驱动
+门控二值化：H(o)               → gate 接近 0 或 1
+去相关：  ‖corr(z) - I‖       → 不同 program 学不同东西
+防死亡：  ‖softplus(−π)‖₁      → 防止所有 gate 学成 0
 ```
 
-- `cis_out` 提供基础表达背景；
-- `trans_out` 负责对 `cis_out` 进行增益/抑制；
-- 相较于加法融合，更符合调控因子依赖顺式可及背景发挥作用的生物逻辑。
 
 ---
 
@@ -187,27 +220,28 @@ total_out = cis_out * (1 + tanh(trans_out))
 
 ---
 
-## Study 1：主性能与结构必要性验证
+## Study 1：主性能与 SCM 结构必要性验证
 
 ### 研究目的
 
-验证非线性建模是否必要、cis/trans 分治是否必要、染色体分块是否必要。
+验证 gate/drive 分治是否必要、hurdle 融合是否必要、禁止边约束是否正确。
 
 ### 比较模型
 
-**主文模型**：Hayat Full / Cis-only / No-blocking / LinearAE
-**补充模型**：Trans-only（偏调制而非独立生成器，放入补充）
-
-### Ablation 定义
+**主模型**：Hayat Full（gate × drive hurdle）
+**Ablation**：
 
 ```
-ablation="full":        total_out = cis_out * (1 + tanh(trans_out))
-ablation="cis_only":    total_out = cis_out
-ablation="no_blocking": 跳过染色体分块，整序列进入 Mamba
+ablation="full":            o * r hurdle            (主模型)
+ablation="soft_gate":       (ε + (1-ε)o) * r       (无二值化正则，gate 糊在 0.5)
+ablation="additive":        o + r                   (加法融合，gate 可被 bypass)
+ablation="no_gate":         r                        (纯 trans drive，无 gate)
+ablation="no_drive":        o                        (纯 gate，无 trans 调制)
+ablation="z_to_gate":       z → gate 边加入         (违反禁止边)
+ablation="u_to_drive":      u → drive 边加入        (违反禁止边)
+ablation="c_to_gate":       c → gate 边加入         (违反禁止边)
+ablation="linear_ae":       LinearAE baseline       (无结构)
 ```
-
-- `cis_only` 可不重训
-- `no_blocking` 在主文中先作为 inference-time stress test
 
 ### 数据
 
@@ -216,88 +250,86 @@ ablation="no_blocking": 跳过染色体分块，整序列进入 Mamba
 
 ### 指标
 
-**重建指标**：Global Pearson、Global Spearman、MSE、Intra-chromosome Pearson、Inter-chromosome Pearson
+**重建指标**：Global Pearson、MSE、Intra-segment Pearson、Inter-segment Pearson
 **扰动指标**：PCC-delta、Common-DEGs、Perturbation-wise MSE
-**距离分层指标**：same block / same chromosome but far / different chromosome
+**结构指标**：gate entropy（二值化程度）、W sparsity（program 稀疏度）、program-gene loading 的模块化程度
+**禁止边指标**：加入禁止边后 gate-ATAC 相关性变化（Study 4 配合）
 
 ### 预期结果
 
-- Full 在总体表现、跨染色体建模和扰动泛化上最优
-- Cis-only 在同染色体指标上接近 Full，但跨染色体和扰动预测明显下降
-- No-blocking 次优，说明分块提供有效结构归纳偏置
-- LinearAE 可拟合平均表达，但缺乏调控传播能力
+- Full hurdle 在跨 segment 建模和扰动泛化上最优
+- Additive 模型的重建可能不差，但 gate 语义退化（gate 失去"开关"意义）
+- No-gate（纯 drive）无法关掉基因，零表达基因预测差
+- No-drive（纯 gate）只能二值输出，无法建模表达强度
+- 加入禁止边 → gate 二值化程度下降 / gate-ATAC 相关性下降
 
 ### 论文图
 
-- 柱状图：各模型 × 指标
-- 距离分层折线图
-- perturbation-wise scatter：Full vs baseline
+- 柱状图：各 ablation × 重建指标 + 扰动指标
+- Gate entropy vs ATAC correlation（展示禁止边如何破坏 gate 语义）
+- perturbation-wise scatter：Full vs key ablations
 
 ---
 
-## Study 2：RegulatorGate 生物学真实性验证
+## Study 2：Trans Programs 生物学真实性验证
 
 ### 研究目的
 
-验证模型选出的 regulator 是否具有真实的转录调控意义。
+验证无先验学出的 trans programs 是否具有真实的转录调控意义，gene-program loading 是否稀疏且可解释。
 
-### 2A. TF 富集分析
+### 2A. Gene-Program Loading 分析
 
-```python
-regulator_idx = model.get_regulator_genes(gene_names, threshold=0.5)
-```
+提取稀疏 loading 矩阵 `W` [G, K]，对每个 program k 取 top loading genes。分析每个 program 的基因集在染色体上的分布（是否跨染色体）、功能富集。
 
-同时做 threshold 版本和 top-K 版本（如 top 300）。与 Lambert 2018 TF 列表比较，计算 overlap、Fisher exact / hypergeometric p 值、odds ratio / enrichment fold。
+### 2B. Program 与已知 TF 的关联
 
-### 2B. GO / Reactome 富集
+对每个 program k，将 top loading genes 与 Lambert 2018 TF list、TRRUST / DoRothEA regulon 做富集检验。注意：这不是"program = TF"，而是"program 可能被某 TF 介导"。统计每个 program 富集到的 TF，计算 overlap p-value。
 
-比较 top 200 regulator vs bottom 200。预期 top regulators 富集 transcription regulation、chromatin remodeling、signal response；low-gate 基因更偏 housekeeping / metabolism。
+### 2C. GO / Reactome 功能注释
 
-### 2C. 与扰动数据的一致性
+对每个 program 的 top 200 loading genes 做 GO/Reactome 富集。预期不同 program 对应不同生物学过程（如 cell cycle、immune response、metabolism）。
 
-在 Schmidt 中定义每个被 perturb 基因的 effect size（DEGs 数量、平均 |delta expression|、perturbation-induced variance），分析 gate_score 与 perturb_effect_size 的相关性。若高 gate 基因在独立 perturbation 中也更能引发广泛表达改变，则说明 gate 学到的确是有效调控因子。
+### 2D. Gate 与 Trans 的交互模式
 
-### 2D. 训练动态
-
-记录每个 epoch 的 active regulator 数量、平均 gate score、gate 稀疏度，展示从全基因到少量 regulator 的收敛过程。
+按 gate score 将基因分为 high-gate 和 low-gate 两组，比较两组的 program loading 模式。预期：high-gate 基因的 loading 集中在特定 program（被主动调控），low-gate 基因的 loading 更均匀（仅背景表达）。
 
 ### 预期结果
 
-- 高 gate 基因显著富集 TF
-- 高 gate 基因富集调控相关功能
-- gate score 与扰动 effect size 显著正相关
-- active regulator 数量收敛至约 200–500
+- K 个 program 收敛到不同生物学功能
+- 部分 program 显著富集已知 TF target
+- W 矩阵稀疏（每个基因仅 2-5 个非零 loading）
+- 高 gate 基因的 program loading 更集中
 
 ### 论文图
 
-- TF enrichment plot
-- gate score vs perturb effect size scatter
-- GO/Reactome enrichment heatmap
-- active regulator 收敛曲线
+- W 矩阵 heatmap（genes × programs，按染色体排序）
+- Per-program GO enrichment dotplot
+- Program-TF enrichment network
+- Gate score vs loading sparsity 关系图
 
 ---
 
-## Study 3：Trans 跨染色体机制验证
+## Study 3：Gate 的 ATAC 样特性验证
 
 ### 研究目的
 
-验证 trans 分支是否真正承担了跨染色体调控建模，而不是简单噪声映射。
+验证 learned gate `o_g` 是否具有类似 chromatin accessibility 的语义——即 gate 学到的"开放/关闭"模式是否与真实的染色质状态一致。
 
-### 3A. 染色体间注意力流矩阵
+### 3A. Gate 二值化程度分析
 
-在线累计 `Flow(chr_target, chr_regulator)`，得到 chr-to-chr 调控流矩阵。
+统计 per-gene gate 的分布：理想情况下 gate 应是双峰的（接近 0 或 1）。计算 gate entropy、bimodality index（BCI），并与随机 baseline 比较。
 
-### 3B. 跨染色体注意力占比
+### 3B. Gate 与基因表达的关系
 
-对每个目标基因计算 `cross_chr_ratio(g)` = 该基因投给不同染色体 regulator 的注意力占比。按 chromosome、gene density、mean expression 分层。
+分析 gate 与基因平均表达、表达方差、zero-inflation 的关系。预期：高 gate 基因表达更高、方差更大、zero 比例更低。
 
-### 3C. 已知 TF target 外部验证
+### 3C. Gate 跨细胞类型的一致性
 
-对 top gate TF 或 top trans regulator：提取模型高 attention target，与 TRRUST / DoRothEA / ChEA 已知 target 比较，进行富集检验。
+在 PBS 数据的不同细胞类型（如有标注）中比较 gate 的稳定性。预期：管家基因的 gate 跨类型一致偏高，细胞类型特异基因的 gate 在对应类型中偏高。
 
-### 计算优化
+### 3D. 与 Multiome ATAC 的外部验证（连接 Study 4）
 
-仅分析 active regulators 或 top-K regulators（如 64/128）。不保存全量 attention，只输出 `chr_flow_matrix.pt`、`cross_chr_ratio.csv`、`regulator_attention_mass.csv`。
+对每个基因比较 learned gate 与 promoter accessibility（来自 Multiome ATAC）。预期显著正相关。
 
 ### 预期结果
 
@@ -317,51 +349,53 @@ regulator_idx = model.get_regulator_genes(gene_names, threshold=0.5)
 
 ### 研究目的
 
-利用公共 10x Multiome PBMC 配对 RNA+ATAC 数据，验证 Hayat 学到的 cis/trans 表征是否与真实染色质状态和细胞类型特异调控一致。这是整个项目的多组学机制验证核心。
+利用公共 10x Multiome PBMC 配对 RNA+ATAC 数据，验证 Hayat 的 learned gate `o_g` 是否与真实染色质可及性一致。这是整个项目的多组学机制验证核心。
 
 ### 核心假设
 
-- **H4.1**：基因的 `cis_score` 与其 promoter accessibility 显著正相关
-- **H4.2**：这一关系在不同 PBMC 细胞类型中均成立
-- **H4.3**：开放 promoter 基因更偏 cis 主导，关闭 promoter 基因更依赖 trans 调制
-- **H4.4**：高 trans regulator 的预测 targets 在相应细胞类型中具有更强的可及性或已知 regulon 支持
+- **H4.1**：per-gene learned gate `o_g`（平均跨细胞）与 promoter accessibility 显著正相关
+- **H4.2**：这一关系在不同 PBMC 细胞类型中均成立（cell-type-specific gate vs ATAC）
+- **H4.3**：高 gate 基因更偏"cis 许可"模式（表达主要受 gate 控制），低 gate 基因更偏"trans 驱动"模式
+- **H4.4**：高 trans program loading 的基因在 gate 开放的前提下，表达主要由对应 program 活性解释
 
 ### 模型内部表征定义
 
-将 Multiome RNA 输入 Hayat，提取：
+将 Multiome RNA 输入 Hayat，直接提取结构化 latent：
 
 ```
-cis_score(g, c)  = ||cis_hidden[g, c]||_2
-trans_score(g, c) = ||trans_hidden[g, c]||_2
+o_g(c)  = gate probability per gene per cell     (from Eq A)
+r_g(c)  = drive per gene per cell                 (from Eq B)
+z_k(c)  = trans program activity per cell         (from encoder)
+u_s(c)  = segment cis state per cell              (from encoder)
 ```
 
-主分析使用平均形式 `cis_score(g) = E_c[||cis_hidden[g, c]||_2]`，以及按细胞类型版本 `cis_score(g, t) = E_{c∈t}[||cis_hidden[g, c]||_2]`。
+主分析使用跨细胞平均值：`ō_g = E_c[o_g(c)]`，按细胞类型版本 `ō_g(t) = E_{c∈t}[o_g(c)]`。
 
 ### 分析内容
 
-#### 4A. 全局基因层面：cis score 与 promoter accessibility
+#### 4A. 全局基因层面：gate 与 promoter accessibility
 
-对每个基因比较 `cis_score(g)` 与 `ATAC(g)`，做 Spearman correlation。预期显著正相关。
+对每个基因比较 `ō_g`（learned gate）与 `ATAC(g)`（promoter accessibility），做 Spearman correlation。预期显著正相关。与 Study 3D 互为验证。
 
 #### 4B. 细胞类型分层验证
 
-在各主要 PBMC 细胞类型内分别计算 `corr_t = Spearman(cis_score(·,t), ATAC(·,t))`，排除 bulk 平均伪相关。
+在各主要 PBMC 细胞类型内分别计算 `corr_t = Spearman(ō_g(·,t), ATAC(·,t))`，排除 bulk 平均伪相关。
 
 #### 4C. 控制表达量后的偏相关
 
-`partial_corr(cis_score, ATAC | RNA)`，若控制表达后仍显著，说明 cis_score 学到的不只是表达强度，而是更接近染色质状态的信息。
+`partial_corr(ō_g, ATAC | RNA_mean)`，若控制表达后仍显著，说明 gate 学到的不只是表达强度，而是更接近染色质状态的信息。
 
 #### 4D. 按 promoter openness 分层评估模型行为
 
-根据 Multiome 的 promoter accessibility 将基因分为 Open / Mid / Closed，比较重建 Pearson、重建 MSE、Schmidt PCC-delta、Common-DEGs、perturbation MSE。预期 Open 基因表现更优。
+根据 Multiome 的 promoter accessibility 将基因分为 Open / Mid / Closed，比较重建 Pearson、重建 MSE、Schmidt PCC-delta。预期 Open 基因重建更优（gate 对其约束更强）。
 
-#### 4E. cis/trans dominance 分析
+#### 4E. Gate × Drive 交互模式
 
-```
-ratio(g) = cis_score(g) / (cis_score(g) + trans_score(g) + ε)
-```
+将基因按 gate score 和 mean drive 分层，观察 gate/drive 的联合分布。预期：存在 high-gate + high-drive（活跃表达基因）、high-gate + low-drive（可表达但未被激活）、low-gate + *（沉默基因）。
 
-比较 Open / Mid / Closed 三组基因的 ratio 分布。预期 Open 组更偏 cis 主导，Closed 组相对更偏 trans 调制。
+#### 4F. Program-Target 跨模态验证
+
+对 top program k，提取其 top loading genes，检查这些基因在相应细胞类型中的 ATAC accessibility 是否更高，与 TRRUST / DoRothEA / ChEA target set 比较。
 
 #### 4F. regulator-target 跨模态验证
 
@@ -369,17 +403,18 @@ ratio(g) = cis_score(g) / (cis_score(g) + trans_score(g) + ε)
 
 ### 预期结果
 
-- cis_score 与 promoter accessibility 在全局及细胞类型层面均显著正相关
+- ō_g 与 promoter accessibility 在全局及细胞类型层面均显著正相关
 - 控制表达量后相关性仍保留
-- Open 基因更偏 cis 主导
-- top regulator 的 targets 兼具更高可及性和更强 regulon 支持
+- High-gate 基因更偏"cis 许可"模式
+- Top program 的 target genes 兼具更高可及性和更强 regulon 支持
 
 ### 论文图
 
-- cis_score vs promoter accessibility 散点图
+- ō_g vs promoter accessibility 散点图
 - 细胞类型相关系数柱状图
-- Open/Mid/Closed 分层箱线图
-- selected regulator target accessibility 图
+- Open/Mid/Closed 分层 gate 分布箱线图
+- Gate × Drive 联合分布 heatmap
+- Selected program target accessibility 图
 
 ---
 
@@ -391,7 +426,7 @@ ratio(g) = cis_score(g) / (cis_score(g) + trans_score(g) + ε)
 
 ### 方案
 
-训练 3 个规模（2k / 10k / 50k cells），比较 Global Pearson、PCC-delta、TF enrichment OR、cis-ATAC Spearman。证明 10k–20k cells 已可得到稳定结果。
+训练 3 个规模（2k / 10k / 50k cells），比较 Global Pearson、PCC-delta、program TF enrichment OR、gate-ATAC Spearman。证明 10k–20k cells 已可得到稳定结果。
 
 ---
 
@@ -410,49 +445,61 @@ ratio(g) = cis_score(g) / (cis_score(g) + trans_score(g) + ε)
 ## 十一、实现结构
 
 ```
+models/
+├── hayat_v2.py                   # Open-Then-Express SCM 模型
+└── model.py                      # Hayat v1 (Mamba2, 保留)
+
+train/
+├── run_training_v2.py            # v2 训练（分阶段 annealing）
+└── run_training.py               # v1 训练
+
 analysis/
-├── study1_benchmark.py          # Full / Cis-only / No-blocking / LinearAE
-├── study2_regulators.py         # TF富集 + GO + 训练动态
-├── study3_trans_flow.py         # 跨染色体注意力流
-├── study4_multiome.py           # 10x Multiome 配对验证
-├── train_linear_ae.py           # 线性AE训练
-├── summarize_metrics.py         # 统一指标汇总
-└── utils_analysis.py            # 共享工具函数
+├── study1_benchmark.py           # Full + forbidden-edge ablations + LinearAE
+├── study2_programs.py            # Trans program 分析 (W loading, TF enrichment, GO)
+├── study3_gate.py                # Gate 分析 (bimodality, expression relation, ATAC)
+├── study4_multiome.py            # 10x Multiome 配对验证
+├── train_linear_ae.py            # 线性AE训练
+├── summarize_metrics.py          # 统一指标汇总
+└── utils_analysis.py             # 共享工具函数
 ```
 
-### 建议模型接口扩展
+### 模型接口
 
 ```python
-forward(
-    x,
-    ablation="full",               # full / cis_only
-    return_hidden=False,            # 返回 cis_out, trans_out
-    return_attention_summary=False  # 返回聚合 attention
+model.forward(
+    x,                              # [B, G] expression
+    e_scGPT=None,                   # [G, 512] optional frozen embeddings
+    ablation="full",                # full / soft_gate / additive / no_gate / no_drive
+    return_latent=False,            # 返回 u, z, c, o, r
 )
 ```
 
-### 建议输出 summary
+### 输出 summary
 
-- `gate_scores.csv`
-- `cis_score_per_gene.pt`
-- `trans_score_per_gene.pt`
-- `chr_flow_matrix.pt`
-- `cross_chr_ratio.csv`
-- `multiome_celltype_scores.csv`
+- `gate_scores.csv` — per-gene learned gate ō_g
+- `drive_scores.csv` — per-gene mean drive r̄_g
+- `program_loadings.csv` — W matrix [G, K]
+- `program_activities.csv` — z per cell [B, K]
+- `segment_states.csv` — u per cell [B, S, d_u]
+- `multiome_celltype_scores.csv` — cell-type-stratified gate vs ATAC
 
 ---
 
 ## 十二、实施步骤
 
+### 阶段 0：实现 v2 模型
+
+1. 实现 `hayat_v2.py`（encoder + SCM decoder）
+2. 实现分阶段训练（warmup → hardening → stable）
+3. 2000 cells 快速验证 gate 二值化、program 稀疏化是否收敛
+
 ### 阶段 1：最小闭环验证
 
-快速确认主线成立：
-
-1. 训练 5k cells 的 Hayat pilot 模型
+1. 训练 5k cells Hayat v2 pilot 模型
 2. 训练 LinearAE
-3. 完成 Study 1 主比较
-4. 完成 Study 2 的 TF 富集
-5. 完成 Study 4 的 cis_score vs ATAC 验证
+3. 完成 Study 1 主比较 + 禁止边 ablation
+4. 完成 Study 2 的 program TF 富集
+5. 完成 Study 4 的 gate vs ATAC 验证
 
 ### 阶段 2：主结果生成
 
@@ -497,12 +544,12 @@ forward(
 
 ## 十五、论文叙事线
 
-1. **问题提出** — 现有表达模型缺少对 cis/trans 调控分工的结构化建模
-2. **方法提出** — Hayat 通过染色体分块双向 Mamba 建模 cis，稀疏 regulator gate 建模 trans，乘性融合表达 "trans 调制 cis"
-3. **结果一：性能与必要性** — Hayat 优于 LinearAE、Cis-only、No-blocking
-4. **结果二：调控因子真实性** — RegulatorGate 识别出真实 TF 与调控相关基因
-5. **结果三：公共多组学交叉验证** — 10x Multiome PBMC 表明 cis 对应真实开放染色质，trans 对应 TF 驱动与跨染色体传播
-6. **结论** — Hayat 是一个兼具性能与机制解释力的表达建模框架
+1. **问题提出** — 现有表达模型将"能否表达"和"表达多少"混为一谈，缺少对 cis 许可/trans 驱动的显式分离
+2. **方法提出** — Hayat 通过 Open-Then-Express SCM：segment cis state → gate（许可），trans programs → drive（强度），hurdle 融合保证 gate 关闭时表达为零。不引入任何外部调控先验
+3. **结果一：性能与 SCM 必要性** — Hayat hurdle 优于 Soft-gate、Additive、No-gate、No-drive；禁止边破坏 gate 语义
+4. **结果二：Trans programs 真实性** — 无先验 programs 富集已知 TF target，gene loading 稀疏且模块化
+5. **结果三：Gate 的 ATAC 样特征** — Learned gate 与独立 Multiome ATAC 的 promoter accessibility 显著一致
+6. **结论** — Hayat 通过结构化 SCM 而非更强 backbone，实现了兼具性能与机制解释力的表达建模
 
 ---
 
@@ -510,9 +557,9 @@ forward(
 
 若希望先做一个低成本但完整闭环的版本，只完成以下 4 项：
 
-1. 训练 10k cells Hayat
+1. 训练 10k cells Hayat v2
 2. 训练 LinearAE
-3. Study 1：Full / Cis-only / No-blocking / LinearAE
-4. Study 2 TF 富集 + Study 4 Multiome 的 cis-ATAC 验证
+3. Study 1：Full + 3 个关键 ablation（no_gate, additive, z_to_gate）
+4. Study 2 program TF 富集 + Study 4 gate-ATAC 验证
 
 这四部分已经足够形成一个完整、可报告、可投稿扩展的核心框架。
