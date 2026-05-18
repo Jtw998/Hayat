@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
-Schmidt perturbation evaluation script.
-Computes 6 metrics for each perturbed gene.
-
-Metrics:
-  Population-average: MSE, E-distance, PCC-delta
-  Population-distribution: Wasserstein distance, KL-divergence, Common-DEGs
-
+Schmidt perturbation evaluation for Hayat.
 Usage:
   python3 evaluate.py --checkpoint ../checkpoints/hayat_checkpoint.pt
 """
@@ -29,8 +23,7 @@ def _wasserstein_1d(u, v):
 
 
 def _kde_kl(p, q, n=500):
-    p = p[p > 0]
-    q = q[q > 0]
+    p, q = p[p > 0], q[q > 0]
     if len(p) < 20 or len(q) < 20:
         return np.nan
     try:
@@ -45,50 +38,36 @@ def _kde_kl(p, q, n=500):
 
 def compute_metrics(pred_mean, true_mat, ctrl_mean, pred_ctrl_mean):
     true_mean = true_mat.mean(axis=0)
-
-    # 1. MSE
-    mse = np.mean((true_mean - pred_mean) ** 2)
-
-    # 2. E-distance
     n_sample = min(200, true_mat.shape[0])
     rng = np.random.default_rng(42)
     idx = rng.choice(true_mat.shape[0], n_sample, replace=False)
-    pred_mat = np.tile(pred_mean, (n_sample, 1))
-    ctrl_mat = np.tile(ctrl_mean, (n_sample, 1))
-    inter = cdist(pred_mat, ctrl_mat).mean()
-    intra = cdist(true_mat[idx], true_mat[idx]).mean()
-    e_dist = 2 * inter - intra
 
-    # 3. PCC-delta
+    mse = np.mean((true_mean - pred_mean) ** 2)
+
+    e_dist = 2 * cdist(np.tile(pred_mean, (n_sample, 1)),
+                       np.tile(ctrl_mean, (n_sample, 1))).mean() \
+             - cdist(true_mat[idx], true_mat[idx]).mean()
+
     delta_pred = pred_mean - pred_ctrl_mean
     delta_true = true_mean - ctrl_mean
-    mask = (np.std(true_mat, axis=0) > 1e-6) & (np.std(pred_mat, axis=0) > 1e-6)
-    pcc_delta = np.corrcoef(delta_pred[mask], delta_true[mask])[0, 1] if mask.sum() > 10 else np.nan
+    mask = (np.std(true_mat, axis=0) > 1e-6)
+    pcc_delta = np.corrcoef(delta_pred[mask], delta_true[mask])[0, 1] if mask.sum() > 10 else 0.0
 
-    # 4. Wasserstein (mean over genes)
-    w_vals = [_wasserstein_1d(true_mat[:, gi], pred_mat[:, gi]) for gi in range(pred_mean.shape[0])]
+    w_vals = [_wasserstein_1d(true_mat[:, gi], np.tile(pred_mean[gi], n_sample))
+              for gi in range(pred_mean.shape[0])]
     wass = np.nanmean(w_vals)
 
-    # 5. KL-divergence (mean over genes)
-    kl_vals = [_kde_kl(pred_mat[:, gi], true_mat[:, gi]) for gi in range(pred_mean.shape[0])]
+    kl_vals = [_kde_kl(np.tile(pred_mean[gi], n_sample), true_mat[:, gi])
+               for gi in range(pred_mean.shape[0])]
     kl_div = np.nanmean([v for v in kl_vals if not np.isnan(v)])
 
-    # 6. Common-DEGs
     K = min(100, pred_mean.shape[0])
-    true_fc = np.abs(true_mean - ctrl_mean)
-    pred_fc = np.abs(pred_mean - pred_ctrl_mean)
-    true_top = set(np.argsort(true_fc)[-K:])
-    pred_top = set(np.argsort(pred_fc)[-K:])
+    true_top = set(np.argsort(np.abs(true_mean - ctrl_mean))[-K:])
+    pred_top = set(np.argsort(np.abs(pred_mean - pred_ctrl_mean))[-K:])
     common_degs = len(true_top & pred_top) / K
 
-    return {
-        "MSE": mse,
-        "E_distance": e_dist,
-        "PCC_delta": pcc_delta if not np.isnan(pcc_delta) else 0.0,
-        "Wasserstein": wass if not np.isnan(wass) else 0.0,
-        "KL_divergence": kl_div if not np.isnan(kl_div) else 0.0,
-        "Common_DEGs": common_degs,
-    }
+    return {"MSE": mse, "E_distance": e_dist, "PCC_delta": pcc_delta,
+            "Wasserstein": wass, "KL_divergence": kl_div, "Common_DEGs": common_degs}
 
 
 def main():
@@ -107,32 +86,28 @@ def main():
 
     print(f"Dataset: {expr.shape[0]} cells x {expr.shape[1]} genes")
 
-    # Gene embeddings
     emb_path = os.path.join(args.data_dir, "schmidt_gene_embeddings.pt")
     gene_emb = torch.load(emb_path) if os.path.exists(emb_path) else None
-    gene_emb_dim = gene_emb.shape[1] if gene_emb is not None else 512
-    print(f"Embeddings: {'loaded' if gene_emb is not None else 'none'}")
+
+    chrom_path = os.path.join(args.data_dir, "schmidt_chrom_boundaries.pt")
+    chrom_boundaries = torch.load(chrom_path)
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Device: {device}")
 
     model = Hayat(
-        num_genes=expr.shape[1],
-        gene_emb_dim=gene_emb_dim,
-        gene_emb=gene_emb,
-        freeze_gene_emb=(gene_emb is not None),
-        chrom_boundaries_path=os.path.join(args.data_dir, "schmidt_chrom_boundaries.pt"),
-        hidden_dim=256,
-        num_mamba_layers=2,
+        chrom_boundaries=chrom_boundaries,
+        gene_emb_dim=gene_emb.shape[1] if gene_emb is not None else 512,
     )
     load_checkpoint(model, args.checkpoint, device)
     model = model.to(device)
     model.eval()
 
+    gene_emb = gene_emb.to(device) if gene_emb is not None else None
+
     expr_np = expr.numpy()
     all_pert_np = np.array(all_pert)
 
-    # Control baseline
     ctrl_mask = all_pert_np == "control"
     ctrl_idx = np.where(ctrl_mask)[0]
     print(f"Control cells: {len(ctrl_idx)}")
@@ -140,15 +115,14 @@ def main():
     ctrl_cells = expr_np[ctrl_idx]
     ctrl_mean = ctrl_cells.mean(axis=0)
 
-    # Model reconstruction of control
     print("Reconstructing control baseline...")
     with torch.no_grad():
         ctrl_tensor = torch.tensor(ctrl_cells, dtype=torch.float32)
         pred_ctrl_list = []
         for i in range(0, len(ctrl_tensor), args.batch_size):
             batch = ctrl_tensor[i:i+args.batch_size].to(device)
-            pred, *_ = model(batch)
-            pred_ctrl_list.append(pred.cpu().numpy())
+            mu, _ = model(batch, gene_emb=gene_emb)
+            pred_ctrl_list.append(mu.cpu().numpy())
         pred_ctrl_mean = np.concatenate(pred_ctrl_list, axis=0).mean(axis=0)
 
     pert_values = sorted(set(all_pert) - {"control"})
@@ -164,21 +138,22 @@ def main():
             continue
 
         true_mat = expr_np[pert_idx[:500]]
-        true_mean = true_mat.mean(axis=0)
-
         pred_input = ctrl_mean.copy()
-        pred_input[gi] = 0.0
+        pred_input[gi] = 0.0  # knockout
+
         with torch.no_grad():
-            pred_out, *_ = model(torch.tensor(pred_input, dtype=torch.float32).unsqueeze(0).to(device))
-            pred_mean = pred_out.squeeze(0).cpu().numpy()
+            mu, _ = model(
+                torch.tensor(pred_input, dtype=torch.float32).unsqueeze(0).to(device),
+                gene_emb=gene_emb,
+            )
+            pred_mean = mu.squeeze(0).cpu().numpy()
 
         metrics = compute_metrics(pred_mean, true_mat, ctrl_mean, pred_ctrl_mean)
         metrics["gene"] = pert_gene
         metrics["n_cells"] = len(pert_idx)
         rows.append(metrics)
         print(f"  {pert_gene}: MSE={metrics['MSE']:.4f}, PCC_delta={metrics['PCC_delta']:.3f}, "
-              f"Wass={metrics['Wasserstein']:.4f}, KL={metrics['KL_divergence']:.3f}, "
-              f"CommonDEGs={metrics['Common_DEGs']:.3f}")
+              f"Wass={metrics['Wasserstein']:.4f}, KL={metrics['KL_divergence']:.3f}")
 
     df = pd.DataFrame(rows)
     out_path = os.path.join(args.data_dir, "schmidt_metrics.csv")
