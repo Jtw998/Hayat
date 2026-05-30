@@ -105,7 +105,15 @@ def _gene_pearson_subset(pred, tgt, mask):
 def calculate_metrics(predictions, targets):
     eps = 1e-8
     G = predictions.shape[1]
-    mse = torch.mean((predictions - targets) ** 2).item()
+    err = predictions - targets
+
+    mse = torch.mean(err ** 2).item()
+    mae = torch.mean(err.abs()).item()
+
+    # R² = 1 - SS_res / SS_tot (across all cells × genes)
+    ss_res = (err ** 2).sum()
+    ss_tot = ((targets - targets.mean()) ** 2).sum()
+    r2 = (1 - ss_res / (ss_tot + eps)).item()
 
     t_mean_cell = torch.mean(targets, dim=1, keepdim=True)
     p_mean_cell = torch.mean(predictions, dim=1, keepdim=True)
@@ -121,6 +129,20 @@ def calculate_metrics(predictions, targets):
     p_std_gene = torch.std(predictions, dim=0)
     gene_pearson = torch.mean(cov_gene / (t_std_gene * p_std_gene + eps)).item()
 
+    # Spearman (rank) — compute on subset to keep memory bounded
+    n_sample = min(predictions.shape[0], 2000)
+    if predictions.shape[0] > n_sample:
+        idx = torch.randperm(predictions.shape[0])[:n_sample]
+        p_sub, t_sub = predictions[idx], targets[idx]
+    else:
+        p_sub, t_sub = predictions, targets
+    p_rank = p_sub.argsort(dim=0).argsort(dim=0).float()
+    t_rank = t_sub.argsort(dim=0).argsort(dim=0).float()
+    r_mean = p_rank.mean(dim=0, keepdim=True)
+    t_mean_r = t_rank.mean(dim=0, keepdim=True)
+    cov_r = ((p_rank - r_mean) * (t_rank - t_mean_r)).mean(dim=0)
+    sr = (cov_r / (p_rank.std(dim=0) * t_rank.std(dim=0) + eps)).mean().item()
+
     gene_var = targets.var(dim=0)
     det_rate = (targets > 0).float().mean(dim=0)
     hvg_mask = gene_var > gene_var.topk(min(2000, G)).values.min()
@@ -128,6 +150,9 @@ def calculate_metrics(predictions, targets):
 
     return {
         "mse": mse,
+        "mae": mae,
+        "r2": r2,
+        "spearman": sr,
         "cell_pearson": cell_pearson,
         "gene_pearson": gene_pearson,
         "gene_hvg": _gene_pearson_subset(predictions, targets, hvg_mask),
