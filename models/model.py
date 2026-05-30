@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Hayat: Open-Then-Express SCM (gene-set agnostic)
+Hayat: Open-Then-Express SCM with delta perturbation heads.
 
-Encoder:
-  x → segment features (mean, var, nz) → û   (cis openness, 3→d_u)
-  x → segment pool → z                        (trans programs, K dims)
-  cell_emb → c                                (cell state, d_c dims)
+Two-stage training:
+  Stage 1 (PBS init): train encoder + SCM baseline on PBS cells only
+  Stage 2 (delta): freeze baseline, train delta heads + perturbation embeddings only
 
-Decoder (gene-conditioned via hypernetworks):
-  π = s_α·α_g + Γ_g·û_s(g)                   gate (α initially suppressed)
-  r = softplus(β_g + W_g·z + Λ_g·c)          drive
-  μ = ℓ · (ε+(1-ε)·o) · r                    hurdle
+Input:
+  x:         [B, G] log1p-normalized expression
+  gene_emb:  [G, D] scGPT gene embeddings
+  pert_info: {'perturbation_id': [B], 'perturbation_type': [B], 'is_perturbed': [B]}
+
+Output:
+  mu1 / mu0, delta_mu, latents
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-import math
 from typing import List, Tuple, Optional, Dict
 
 
@@ -25,33 +26,11 @@ def make_hyper(in_dim: int, hidden: int, out_dim: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(), nn.Linear(hidden, out_dim))
 
 
-class PerturbEmbedding(nn.Module):
-    """p = E_cyto[cytokine] + E_dose[dose] + E_time[time]"""
-    def __init__(self, n_cytokines: int, n_doses: int, n_times: int, d_p: int = 32):
-        super().__init__()
-        self.d_p = d_p
-        self.cyto_emb = nn.Embedding(n_cytokines + 1, d_p, padding_idx=0)
-        self.dose_emb = nn.Embedding(n_doses + 1, d_p, padding_idx=0)
-        self.time_emb = nn.Embedding(n_times + 1, d_p, padding_idx=0)
-        for emb in [self.cyto_emb, self.dose_emb, self.time_emb]:
-            nn.init.normal_(emb.weight, std=0.01)
-
-    def forward(self, pert_info: Dict[str, Tensor]) -> Tensor:
-        B = pert_info[list(pert_info.keys())[0]].shape[0]
-        device = pert_info[list(pert_info.keys())[0]].device
-        p = torch.zeros(B, self.d_p, device=device)
-        for key, emb in [('cytokine', self.cyto_emb), ('dose', self.dose_emb), ('time', self.time_emb)]:
-            if key in pert_info:
-                p = p + emb(pert_info[key])
-        return p
-
-
 class Hayat(nn.Module):
     def __init__(
         self,
         chrom_boundaries: List[Tuple[int, int]],
         gene_emb_dim: int = 512,
-        cell_emb_dim: int = 0,
         d_u: int = 16,
         K: int = 64,
         d_c: int = 32,
@@ -60,37 +39,31 @@ class Hayat(nn.Module):
         hyper_hidden: int = 64,
         d_p: int = 32,
         d_q: int = 16,
-        n_cytokines: int = 100,
-        n_doses: int = 10,
-        n_times: int = 10,
+        d_type: int = 16,
+        n_perturbation_types: int = 5,
+        n_perturbations: int = 92,
     ):
         super().__init__()
         self.num_segments = len(chrom_boundaries)
-        self.d_u = d_u
-        self.K = K
-        self.d_c = d_c
-        self.d_v = d_v
-        self.R = R
-        self.gene_emb_dim = gene_emb_dim
         self.chrom_boundaries = chrom_boundaries
 
-        # Segment index lookup [G] — for vectorized segment operations
-        seg_idx = torch.zeros(0, dtype=torch.long)
+        num_genes = max(end for _, end in chrom_boundaries)
+        seg_idx = torch.zeros(num_genes, dtype=torch.long)
+        for i, (start, end) in enumerate(chrom_boundaries):
+            seg_idx[start:end] = i
         self.register_buffer('_seg_idx', seg_idx)
 
-        # Annealing
-        self.register_buffer('gate_tau', torch.tensor(1.0))
-        self.register_buffer('epsilon', torch.tensor(0.5))
-        self.register_buffer('alpha_scale', torch.tensor(0.0))
+        # RL annealing (gate: Gumbel temp; drive: Gaussian noise)
+        self.register_buffer('gate_temperature', torch.tensor(1.0))
+        self.register_buffer('drive_noise_scale', torch.tensor(0.1))
 
-        # ── Gene-conditioned hypernetworks ──
-        self.hyper_alpha  = make_hyper(gene_emb_dim, hyper_hidden, 1)    # → α_g
-        self.hyper_Gamma  = make_hyper(gene_emb_dim, hyper_hidden, d_u)  # → Γ_g
-        self.hyper_beta   = make_hyper(gene_emb_dim, hyper_hidden, 1)    # → β_g
-        self.hyper_W      = make_hyper(gene_emb_dim, hyper_hidden, K)    # → W_g
-        self.hyper_Lambda = make_hyper(gene_emb_dim, hyper_hidden, d_c)  # → Λ_g
-        self.hyper_rho    = make_hyper(gene_emb_dim, hyper_hidden, d_v)  # → ρ_g (local drive)
-        self.hyper_theta  = make_hyper(gene_emb_dim, hyper_hidden, 1)    # → log θ_g
+        # ── Gene-conditioned hypernetworks (SCM baseline) ──
+        self.hyper_alpha  = make_hyper(gene_emb_dim, hyper_hidden, 1)
+        self.hyper_Gamma  = make_hyper(gene_emb_dim, hyper_hidden, d_u)
+        self.hyper_beta   = make_hyper(gene_emb_dim, hyper_hidden, 1)
+        self.hyper_W      = make_hyper(gene_emb_dim, hyper_hidden, K)
+        self.hyper_Lambda = make_hyper(gene_emb_dim, hyper_hidden, d_c)
+        self.hyper_rho    = make_hyper(gene_emb_dim, hyper_hidden, d_v)
 
         for hyper in [self.hyper_alpha, self.hyper_Gamma, self.hyper_beta,
                       self.hyper_W, self.hyper_Lambda, self.hyper_rho]:
@@ -108,50 +81,50 @@ class Hayat(nn.Module):
         self.mlp_z = nn.Sequential(
             nn.Linear(self.num_segments, 128), nn.GELU(), nn.Linear(128, K),
         )
+        self.mlp_c = nn.Sequential(
+            nn.Linear(3, d_c * 2), nn.GELU(), nn.Linear(d_c * 2, d_c),
+        )
 
-        # ── Bilinear gene×cell interaction ──
-        self.A = nn.Linear(gene_emb_dim, R, bias=False)    # gene embedding → R
-        self.B = nn.Linear(K + d_c, R, bias=False)          # cell state [z;c] → R
-        self.A.weight.data.mul_(0.01)
-        self.B.weight.data.mul_(0.01)
+        # ── Bilinear gene×cell ──
+        self.A = nn.Linear(gene_emb_dim, R, bias=False)
+        self.B = nn.Linear(K + d_c, R, bias=False)
+        nn.init.normal_(self.A.weight, std=0.01)
+        nn.init.normal_(self.B.weight, std=0.01)
 
-        if cell_emb_dim > 0:
-            self.cell_emb_proj = nn.Linear(cell_emb_dim, d_c)
-            self.mlp_c_fallback = None
-        else:
-            self.cell_emb_proj = None
-            self.mlp_c_fallback = nn.Sequential(
-                nn.Linear(3, d_c), nn.GELU(), nn.Linear(d_c, d_c),
-            )
+        # ── Perturbation embedding ──
+        self.pert_emb = nn.Embedding(n_perturbations + 1, d_p, padding_idx=0)
+        nn.init.normal_(self.pert_emb.weight, std=0.01)
+        self.type_emb = nn.Embedding(n_perturbation_types, d_type)
+        nn.init.normal_(self.type_emb.weight, std=0.01)
+        self.p_combine = nn.Linear(d_p + d_type, d_p)
+        nn.init.normal_(self.p_combine.weight, std=0.01)
+        nn.init.zeros_(self.p_combine.bias)
 
-        # ── Perturbation ──
-        self.d_p = d_p
+        # ── Delta heads (only these + pert_emb get gradient in stage 2) ──
+        d_h = K + d_c + d_p
         self.d_q = d_q
-        self.d_h = K + d_c + d_p
-        self.pert_embed = PerturbEmbedding(n_cytokines, n_doses, n_times, d_p)
+        self.d_p = d_p
         self.mlp_q = nn.Sequential(
             nn.Linear(d_u + d_v + d_p, d_q * 2), nn.GELU(), nn.Linear(d_q * 2, d_q),
         )
-        self.hyper_w_pi = make_hyper(gene_emb_dim, hyper_hidden, self.d_h)
+        self.hyper_w_pi = make_hyper(gene_emb_dim, hyper_hidden, d_h)
         self.hyper_b_pi = make_hyper(gene_emb_dim, hyper_hidden, d_q)
-        self.hyper_w_mu = make_hyper(gene_emb_dim, hyper_hidden, self.d_h)
+        self.hyper_w_mu = make_hyper(gene_emb_dim, hyper_hidden, d_h)
         self.hyper_b_mu = make_hyper(gene_emb_dim, hyper_hidden, d_q)
+
         for hyper in [self.hyper_w_pi, self.hyper_b_pi, self.hyper_w_mu, self.hyper_b_mu]:
             hyper[-1].weight.data.mul_(0.01)
             hyper[-1].bias.data.zero_()
 
-        self._param_cache = {}
-
     # ── Parameter generation ──
     def _gene_params(self, gene_emb: Tensor) -> Dict[str, Tensor]:
         return {
-            'alpha':  self.hyper_alpha(gene_emb).squeeze(-1),
-            'Gamma':  self.hyper_Gamma(gene_emb),
-            'beta':   self.hyper_beta(gene_emb).squeeze(-1),
-            'W':      self.hyper_W(gene_emb),
-            'Lambda': self.hyper_Lambda(gene_emb),
-            'rho':    self.hyper_rho(gene_emb),
-            'log_theta': self.hyper_theta(gene_emb).squeeze(-1),
+            'alpha':   self.hyper_alpha(gene_emb).squeeze(-1),
+            'Gamma':   self.hyper_Gamma(gene_emb),
+            'beta':    self.hyper_beta(gene_emb).squeeze(-1),
+            'W':       self.hyper_W(gene_emb),
+            'Lambda':  self.hyper_Lambda(gene_emb),
+            'rho':     self.hyper_rho(gene_emb),
         }
 
     def _delta_params(self, gene_emb: Tensor) -> Dict[str, Tensor]:
@@ -162,189 +135,230 @@ class Hayat(nn.Module):
             'b_mu': self.hyper_b_mu(gene_emb),
         }
 
-    def _segment_features(self, x_log: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-        """Per-segment [mean, variance, nonzero_rate] → [B, S, 3].
-        Vectorized via scatter_add — no Python loop over segments."""
+    def _cached_params(self, gene_emb: Tensor):
+        """Cache hypernetwork outputs — gene_emb is fixed, avoid recomputing.
+        Only caches SCM baseline params (frozen in stage 2). Delta params
+        need gradients so they are NOT cached."""
+        if not hasattr(self, '_param_cache') or self._param_cache.get('_ptr') != id(gene_emb):
+            self._param_cache = {
+                '_ptr': id(gene_emb),
+                'gene': {k: v.detach() for k, v in self._gene_params(gene_emb).items()},
+                'A': self.A(gene_emb).detach(),
+            }
+        return self._param_cache
+
+    def _build_pert_vector(self, pert_id, pert_type, gene_emb):
+        """Build unified perturbation vector [B, d_p]."""
+        B, device = pert_id.shape[0], pert_id.device
+        pert_vec = torch.zeros(B, self.d_p, device=device)
+
+        # Type 1 (cytokine): learned embedding
+        if (pert_type == 1).any():
+            mask = (pert_type == 1).unsqueeze(-1)
+            ids = pert_id * (pert_type == 1).long()
+            pert_vec = torch.where(mask, self.pert_emb(ids), pert_vec)
+
+        # Type 2+ (CRISPR): not used in cytokine data, handled by perturbation_id
+        for t in range(2, pert_type.max().item() + 1):
+            if (pert_type == t).any():
+                mask = (pert_type == t).unsqueeze(-1)
+                ids = (pert_id * (pert_type == t).long()).clamp(0, gene_emb.shape[0] - 1)
+                pert_vec = torch.where(mask, self.pert_emb(ids), pert_vec)
+
+        # Type 0 (control): zeros (already initialized)
+
+        t_emb = self.type_emb(pert_type)
+        return self.p_combine(torch.cat([pert_vec, t_emb], dim=-1))
+
+    def _segment_features(self, x_log: Tensor) -> Tensor:
         B, G = x_log.shape
 
-        # Lazy init segment index
-        if self._seg_idx.shape[0] != G:
-            seg_idx = torch.zeros(G, dtype=torch.long)
-            for i, (start, end) in enumerate(self.chrom_boundaries):
-                seg_idx[start:end] = i
-            self._seg_idx = seg_idx.to(x_log.device)
+        seg_idx = self._seg_idx.unsqueeze(0).expand(B, -1)
+        w = torch.ones(B, G, device=x_log.device)
 
-        seg_idx = self._seg_idx.unsqueeze(0).expand(B, -1)  # [B, G]
-        if mask is not None:
-            if mask.dim() == 1:
-                mask = mask.unsqueeze(0)
-            w = mask
-        else:
-            w = torch.ones(B, G, device=x_log.device)
-
-        # Count per segment
         count = torch.zeros(B, self.num_segments, device=x_log.device)
-        count.scatter_add_(1, seg_idx, w)
-        count = count.clamp(1)
+        count.scatter_add_(1, seg_idx, w).clamp_(1)
 
-        # Mean
         mean = torch.zeros(B, self.num_segments, device=x_log.device)
         mean.scatter_add_(1, seg_idx, x_log * w)
         mean = mean / count
 
-        # Variance = E[x²] - E[x]²
-        mean_per_gene = mean.gather(1, seg_idx)  # [B, G]
-        sq_diff = (x_log - mean_per_gene) ** 2
+        mean_per_gene = mean.gather(1, seg_idx)
         var = torch.zeros(B, self.num_segments, device=x_log.device)
-        var.scatter_add_(1, seg_idx, sq_diff * w)
+        var.scatter_add_(1, seg_idx, (x_log - mean_per_gene) ** 2 * w)
         var = var / count
 
-        # Nonzero rate
         nz = torch.zeros(B, self.num_segments, device=x_log.device)
         nz.scatter_add_(1, seg_idx, (x_log > 1e-6).float() * w)
         nz = nz / count
 
-        return torch.stack([mean, var, nz], dim=-1)  # [B, S, 3]
+        return torch.stack([mean, var, nz], dim=-1)
 
     def _gumbel_sigmoid(self, logits: Tensor, tau: float) -> Tensor:
+        """Gumbel-Sigmoid: discrete binary gate with differentiable relaxation."""
         u = torch.rand_like(logits)
         g = -torch.log(-torch.log(u.clamp(1e-10, 1 - 1e-10)))
         return torch.sigmoid((logits + g) / tau)
 
-    # ── Forward ──
-    def forward(
-        self,
-        x: Tensor,
-        gene_emb: Tensor,
-        cell_emb: Optional[Tensor] = None,
-        observed_mask: Optional[Tensor] = None,
-        gene_mask: Optional[Tensor] = None,
-        pert_info: Optional[Dict[str, Tensor]] = None,
-        return_latent: bool = False,
-        ablation: str = "full",
-    ) -> Tuple[Tensor, Tensor, Optional[Dict[str, Tensor]]]:
+    def baseline_forward(self, x, gene_emb, return_latent=False):
         """
-        Args:
-            x:             [B, G] expression counts
-            gene_emb:      [G, D] gene embeddings
-            cell_emb:      [B, D_cell] cell embeddings (optional)
-            observed_mask: [B, G] 1=measured, 0=missing
-            gene_mask:     [B, G] 1=visible to encoder, 0=masked (prediction target)
-            pert_info:     {'cytokine': [B], 'dose': [B], 'time': [B]} (optional)
-            ablation:      "full" / "no_gate" / "no_drive" / "additive"
+        Pure SCM baseline (no delta). Used during PBS pre-training.
+        Returns mu0 = ℓ · o · r
         """
         B, G = x.shape
-        x_log = torch.log1p(x)
-
+        x_log = torch.log1p(x.clamp(1e-8))
         gene_emb = gene_emb.to(device=x.device)
+
+        seg_feats = self._segment_features(x_log)
+        u = self.mlp_u(seg_feats)
+        v = self.mlp_v(seg_feats)
+        z = self.mlp_z(seg_feats[:, :, 0])
+        c = self.mlp_c(torch.stack([
+            x_log.mean(dim=-1), x_log.std(dim=-1),
+            (x < 1e-6).float().mean(dim=-1),
+        ], dim=-1))
+
         params = self._gene_params(gene_emb)
-        alpha, Gamma = params['alpha'], params['Gamma']
-        beta, W = params['beta'], params['W']
-        Lambda = params['Lambda']
-        log_theta = params['log_theta']
+        u_g = u[:, self._seg_idx, :]
+        pi = params['alpha'] + (params['Gamma'] * u_g).sum(dim=-1)
+        o = torch.sigmoid(pi)
 
-        # ── Encoder (masked genes excluded from segment pooling) ──
-        encoder_mask = observed_mask
-        if gene_mask is not None:
-            encoder_mask = gene_mask if observed_mask is None else observed_mask * gene_mask
+        v_g = v[:, self._seg_idx, :]
+        local_drive = (params['rho'] * v_g).sum(dim=-1)
+        h_cell = torch.cat([z, c], dim=-1)
+        a_g = self.A(gene_emb)
+        b_cell = self.B(h_cell)
+        bilinear = (a_g.unsqueeze(0) * b_cell.unsqueeze(1)).sum(dim=-1)
+        r_raw = F.softplus(params['beta'] + (z @ params['W'].T) + (c @ params['Lambda'].T)
+                           + local_drive + bilinear)
+        # Cap drive to enforce gate participation
+        r = r_raw.clamp(max=10.0)
 
-        seg_feats = self._segment_features(x_log, encoder_mask)  # [B, S, 3]
-        u = self.mlp_u(seg_feats)                                   # [B, S, d_u]
-        v = self.mlp_v(seg_feats)                                   # [B, S, d_v]  local drive state
-        z = self.mlp_z(seg_feats[:, :, 0])                          # [B, K]
-
-        if self.cell_emb_proj is not None and cell_emb is not None:
-            c = self.cell_emb_proj(cell_emb)
-        elif self.mlp_c_fallback is not None:
-            c = self.mlp_c_fallback(torch.stack([
-                x_log.mean(dim=-1), x_log.std(dim=-1), (x == 0).float().mean(dim=-1),
-            ], dim=-1))
-        else:
-            c = torch.zeros(B, self.d_c, device=x.device)
-
-        # ── Gate (unchanged) ──
-        u_g = u[:, self._seg_idx, :]                                # [B, G, d_u]
-        as_ = self.alpha_scale.item()
-        pi = as_ * alpha + (Gamma * u_g).sum(dim=-1)                # [B, G]
-
-        if self.training:
-            o_raw = self._gumbel_sigmoid(pi, self.gate_tau.item())
-        else:
-            o_raw = torch.sigmoid(pi)
-
-        # ── Drive (with local segment path + bilinear gene×cell) ──
-        rho = params['rho']                                          # [G, d_v]
-        v_g = v[:, self._seg_idx, :]                                 # [B, G, d_v]
-        local_drive = (rho * v_g).sum(dim=-1)                        # [B, G]
-
-        # Bilinear gene×cell: (A·e_g) · (B·[z;c])
-        h_cell = torch.cat([z, c], dim=-1)                           # [B, K+d_c]
-        a_g = self.A(gene_emb)                                       # [G, R]
-        b_cell = self.B(h_cell)                                       # [B, R]
-        bilinear = (a_g.unsqueeze(0) * b_cell.unsqueeze(1)).sum(dim=-1)  # [B, G]
-
-        r = F.softplus(
-            beta + (z @ W.T) + (c @ Lambda.T) + local_drive + bilinear
-        )  # [B, G]
-
-        # ── Hurdle fusion (for unmasked genes, used in reconstruction) ──
         ell = x.sum(dim=-1, keepdim=True)
         ell = ell / ell.mean().clamp(1e-8)
-        eps = self.epsilon.item() if self.training else 0.01
-        o_eff = eps + (1 - eps) * o_raw
-
-        if ablation == "no_gate":
-            mu = ell * r
-        elif ablation == "no_drive":
-            mu = ell * o_eff
-        elif ablation == "additive":
-            mu = ell * (o_eff + r)
-        else:
-            mu = ell * o_eff * r
-
-        theta = F.softplus(log_theta)
-
-        # ── Delta (perturbation) ──
-        delta_pi, delta_mu, pi_pert, mu_pert, o_pert = None, None, None, None, None
-        if pert_info is not None:
-            delta_params = self._delta_params(gene_emb)
-            p = self.pert_embed(pert_info)                                # [B, d_p]
-            h = torch.cat([z, c, p], dim=-1)                              # [B, d_h]
-
-            # Segment response to perturbation
-            p_exp = p.unsqueeze(1).expand(-1, self.num_segments, -1)     # [B, S, d_p]
-            q = self.mlp_q(torch.cat([u, v, p_exp], dim=-1))              # [B, S, d_q]
-            q_g = q[:, self._seg_idx, :]                                  # [B, G, d_q]
-
-            w_pi, b_pi = delta_params['w_pi'], delta_params['b_pi']
-            w_mu, b_mu = delta_params['w_mu'], delta_params['b_mu']
-
-            delta_pi = (h @ w_pi.T) + (q_g * b_pi).sum(-1)               # [B, G]
-            delta_mu = (h @ w_mu.T) + (q_g * b_mu).sum(-1)               # [B, G]
-
-            pi_pert = pi + delta_pi                                       # [B, G]
-            if self.training:
-                o_pert = torch.sigmoid(pi_pert)  # no gumbel on delta head initially
-            else:
-                o_pert = torch.sigmoid(pi_pert)
-            mu_pert = mu * torch.exp(delta_mu)                            # [B, G] log-space shift
+        eps_open = 0.01
+        mu0 = ell * (eps_open + (1 - eps_open) * o) * r
 
         if return_latent:
-            gamma_u = (Gamma * u_g).sum(dim=-1)
-            return mu, theta, {
-                'u': u, 'z': z, 'c': c,
-                'o_raw': o_raw, 'o_eff': o_eff, 'r': r, 'pi': pi,
-                'W': W, 'alpha': alpha, 'Gamma': Gamma, 'beta': beta, 'Lambda': Lambda,
-                'gamma_u': gamma_u,
-                'p': p if pert_info is not None else None,
-                'delta_pi': delta_pi, 'delta_mu': delta_mu,
-                'pi_pert': pi_pert, 'mu_pert': mu_pert, 'o_pert': o_pert,
+            gamma_u = (params['Gamma'] * u_g).sum(dim=-1)
+            return mu0, {
+                'u': u, 'v': v, 'z': z, 'c': c,
+                'pi': pi, 'o': o, 'r': r,
+                'alpha': params['alpha'], 'Gamma': params['Gamma'],
+                'beta': params['beta'], 'W': params['W'],
+                'Lambda': params['Lambda'], 'rho': params['rho'],
+                'gamma_u': gamma_u, 'a_g': a_g, 'b_cell': b_cell,
             }
-        return mu, theta
+        return mu0
 
-    # ── Annealing ──
-    def set_annealing(self, gate_tau: float, epsilon: float, alpha_scale: float = None):
-        self.gate_tau.fill_(gate_tau)
-        self.epsilon.fill_(epsilon)
-        if alpha_scale is not None:
-            self.alpha_scale.fill_(alpha_scale)
+    def forward(self, x, gene_emb, pert_info, return_latent=False, rl_training=False):
+        """
+        Full forward (baseline + delta). Used in stage 2.
+        Returns mu1, delta_mu, latents.
+        Baseline params are frozen — only delta heads + pert_emb train.
+        """
+        B, G = x.shape
+        x_log = torch.log1p(x.clamp(1e-8))
+        gene_emb = gene_emb.to(device=x.device)
+        device = x.device
+
+        # ── Encoder (frozen after stage 1) ──
+        seg_feats = self._segment_features(x_log)
+        u = self.mlp_u(seg_feats)
+        v = self.mlp_v(seg_feats)
+        z = self.mlp_z(seg_feats[:, :, 0])
+        c = self.mlp_c(torch.stack([
+            x_log.mean(dim=-1), x_log.std(dim=-1),
+            (x < 1e-6).float().mean(dim=-1),
+        ], dim=-1))
+
+        # ── SCM baseline (frozen after stage 1) ──
+        cache = self._cached_params(gene_emb)
+        params = cache['gene']
+        u_g = u[:, self._seg_idx, :]
+        pi = params['alpha'] + (params['Gamma'] * u_g).sum(dim=-1)
+        o = torch.sigmoid(pi)
+
+        v_g = v[:, self._seg_idx, :]
+        local_drive = (params['rho'] * v_g).sum(dim=-1)
+        h_cell = torch.cat([z, c], dim=-1)
+        a_g = cache['A']
+        b_cell = self.B(h_cell)
+        bilinear = (a_g.unsqueeze(0) * b_cell.unsqueeze(1)).sum(dim=-1)
+        r_raw = F.softplus(params['beta'] + (z @ params['W'].T) + (c @ params['Lambda'].T)
+                           + local_drive + bilinear)
+        # Cap drive to enforce gate participation
+        r = r_raw.clamp(max=10.0)
+
+        ell = x.sum(dim=-1, keepdim=True)
+        ell = ell / ell.mean().clamp(1e-8)
+        eps_open = 0.01
+        mu0 = ell * (eps_open + (1 - eps_open) * o) * r
+
+        # ── Perturbation vector (trainable in stage 2) ──
+        pert_id = pert_info.get('perturbation_id', torch.zeros(B, dtype=torch.long, device=device))
+        pert_type = pert_info.get('perturbation_type', torch.zeros(B, dtype=torch.long, device=device))
+        p = self._build_pert_vector(pert_id, pert_type, gene_emb)
+
+        # ── Delta heads (trainable in stage 2) ──
+        delta_params = self._delta_params(gene_emb)
+        h = torch.cat([z, c, p], dim=-1)
+        p_exp = p.unsqueeze(1).expand(-1, self.num_segments, -1)
+        q = self.mlp_q(torch.cat([u, v, p_exp], dim=-1))
+        q_g = q[:, self._seg_idx, :]
+
+        mu_delta_pi = (h @ delta_params['w_pi'].T) + (q_g * delta_params['b_pi']).sum(dim=-1)
+        mu_delta_mu = (h @ delta_params['w_mu'].T) + (q_g * delta_params['b_mu']).sum(dim=-1)
+
+        # ── RL-sampled perturbation (discrete gate + continuous drive) ──
+        if rl_training and self.training:
+            tau = self.gate_temperature.item()
+            pi1 = pi + mu_delta_pi
+            o1_raw = self._gumbel_sigmoid(pi1, tau)
+            sigma = self.drive_noise_scale.item()
+            delta_mu = mu_delta_mu + sigma * torch.randn_like(mu_delta_mu)
+            # Straight-Through: hard gate forward, soft gradient backward
+            o1 = (o1_raw.detach() > 0.5).float() + o1_raw - o1_raw.detach()
+        else:
+            pi1 = pi + mu_delta_pi
+            o1 = torch.sigmoid(pi1)
+            delta_mu = mu_delta_mu
+
+        r1 = (r * torch.exp(delta_mu)).clamp(max=10.0)
+        mu1 = ell * (eps_open + (1 - eps_open) * o1) * r1
+
+        if return_latent:
+            gamma_u = (params['Gamma'] * u_g).sum(dim=-1)
+            delta_pi = pi1 - pi  # actual delta after gumbel/gaussian sampling
+            return mu1, delta_mu, {
+                'z': z, 'c': c, 'u': u, 'v': v,
+                'pi': pi, 'o': o, 'r': r, 'mu0': mu0,
+                'gamma_u': gamma_u,
+                'p': p, 'pert_id': pert_id, 'pert_type': pert_type,
+                'delta_pi': delta_pi, 'delta_mu': delta_mu,
+                'mu_delta_pi': mu_delta_pi, 'mu_delta_mu': mu_delta_mu,
+                'pi1': pi1, 'o1': o1, 'r1': r1,
+            }
+        return mu1, delta_mu
+
+    # ── Freeze/unfreeze for two-stage training ──
+    def freeze_baseline(self):
+        """Freeze encoder + SCM hypernets + A/B. Keep delta + pert_emb trainable."""
+        delta_params = set()
+        for name, p in self.named_parameters():
+            if any(k in name for k in ['hyper_w_', 'hyper_b_', 'mlp_q.', 'pert_emb', 'type_emb', 'p_combine']):
+                delta_params.add(name)
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+        print(f"[Freeze] Frozen all baseline params. Trainable only: delta heads + perturbation embeddings")
+
+    def unfreeze_all(self):
+        for p in self.parameters():
+            p.requires_grad = True
+        print(f"[Unfreeze] All params trainable")
+
+    def set_gate_temp(self, tau: float, drive_noise: float = None):
+        self.gate_temperature.fill_(max(0.1, tau))
+        if drive_noise is not None:
+            self.drive_noise_scale.fill_(max(0.0, drive_noise))

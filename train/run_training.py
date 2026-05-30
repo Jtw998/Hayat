@@ -1,407 +1,203 @@
 #!/usr/bin/env python3
-"""
-Hayat training with gene-conditioned decoder + 3-phase annealing.
-Gene embeddings → hypernetworks → per-gene params (α, β, Γ, W, Λ, θ).
-No fixed gene set — works with any genes that have scGPT embeddings.
-"""
-import os
-import torch
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, Dataset
+"""Hayat two-stage: PBS pre-train + delta RL — all dense in-memory."""
+import os, torch, torch.optim as optim
 from tqdm import tqdm
-
 from models import Hayat
-from utils.losses import compute_loss, delta_loss, config, calculate_metrics, save_checkpoint, load_checkpoint
+from utils.losses import delta_loss, config, calculate_metrics, save_checkpoint, load_checkpoint
+from utils.stream_dataset import DenseDataset, dense_loader, n_batches
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-class PertDataset(Dataset):
-    def __init__(self, x, pert_labels=None):
-        self.x = x
-        self.pert_labels = pert_labels
+def train_pbs(model, dataset, val_dataset, config, device, optimizer, gene_emb):
+    epochs = config.get("pbs_epochs", 20)
+    bm, of_w, of_t, ro = config["gate_bimodal_weight"], config["open_fraction_weight"], \
+                         config["open_fraction_target"], config["r_o_couple_weight"]
+    bs = config["batch_size"]
 
-    def __len__(self):
-        return len(self.x)
+    print(f"\n{'='*60}")
+    print(f"Stage 1: PBS pre-train (dense, {epochs} epochs, bs={bs})")
+    print(f"{'='*60}")
 
-    def __getitem__(self, idx):
-        if self.pert_labels is None:
-            return self.x[idx], None
-        return self.x[idx], {k: v[idx] for k, v in self.pert_labels.items()}
+    best_val = float("inf")
+    for epoch in range(epochs):
+        model.train()
+        tl, n = 0.0, 0
+        loader = dense_loader(dataset, bs, shuffle=True, seed=42 + epoch)
+        for x, _ in tqdm(loader, desc=f"PBS {epoch+1}", total=n_batches(len(dataset), bs)):
+            optimizer.zero_grad()
+            mu0, lat = model.baseline_forward(x.to(device), gene_emb, return_latent=True)
+            o, r = lat['o'], lat['r']
+            mse = torch.nn.functional.mse_loss(mu0, x.to(device))
+            loss = mse + bm*(o*(1-o)).mean() + of_w*(o.mean()-of_t)**2 + ro*(r**2*(1-o)).mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip_value"])
+            optimizer.step()
+            tl += loss.item(); n += 1
 
+        model.eval()
+        vl, nv = 0.0, 0
+        with torch.no_grad():
+            for x, _ in tqdm(dense_loader(val_dataset, bs, shuffle=False),
+                             desc="PBS Val", total=n_batches(len(val_dataset), bs)):
+                mu0, _ = model.baseline_forward(x.to(device), gene_emb, return_latent=True)
+                vl += torch.nn.functional.mse_loss(mu0, x.to(device)).item(); nv += 1
+        print(f"  train={tl/n:.4f} val={vl/nv:.4f}")
+        if vl/nv < best_val:
+            best_val = vl/nv
+            save_checkpoint(model, os.path.join(ROOT, "checkpoints", "hayat_pbs.pt"))
+            print("  saved")
 
-def create_dataloaders(train_data, val_data, train_cell_emb=None, val_cell_emb=None,
-                       train_pert=None, val_pert=None):
-    if train_pert is not None:
-        train_ds = PertDataset(train_data, train_pert)
-        val_ds = PertDataset(val_data, val_pert)
-    elif train_cell_emb is not None:
-        train_ds = TensorDataset(train_data, train_cell_emb)
-        val_ds = TensorDataset(val_data, val_cell_emb)
-    else:
-        train_ds = TensorDataset(train_data)
-        val_ds = TensorDataset(val_data)
-
-    def collate(batch):
-        if isinstance(batch[0], tuple) and len(batch[0]) == 2:
-            has_pert = batch[0][1] is not None
-            x = torch.stack([s[0] for s in batch])
-            if has_pert:
-                pert = {k: torch.stack([s[1][k] for s in batch]) for k in batch[0][1]}
-            else:
-                pert = None
-            return x, pert
-        else:
-            return torch.stack([s for s in batch]), None
-
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, collate_fn=collate)
-    return train_loader, val_loader
-
-
-def get_annealing(epoch, num_epochs):
-    """
-    3-stage schedule:
-      Stage 0 (drive warmup):   o≡1, alpha_scale=0     epochs 0–4
-      Stage 1 (gate from u):    alpha_scale=0.1         epochs 5–14
-      Stage 2 (full gate):      alpha_scale→1, harden   epochs 15+
-    """
-    stage0_end = max(1, int(num_epochs * 0.05))   # 5%
-    stage1_end = max(1, int(num_epochs * 0.15))   # 15%
-
-    if epoch < stage0_end:
-        # Stage 0: gate disabled, train drive only
-        return 1.0, 0.5, 0.0
-    elif epoch < stage1_end:
-        # Stage 1: Γ·u active, α suppressed
-        return 1.0, 0.1, 0.1
-    else:
-        # Stage 2: α ramps up, hardening
-        frac = (epoch - stage1_end) / max(num_epochs - stage1_end - 1, 1)
-        alpha_scale = 0.1 + 0.9 * frac
-        tau = 1.0 - 0.5 * frac
-        eps = 0.1 - 0.09 * frac
-        return tau, eps, alpha_scale
+    load_checkpoint(model, os.path.join(ROOT, "checkpoints", "hayat_pbs.pt"), device)
+    print(f"[PBS] done. best={best_val:.4f}")
 
 
-def train_epoch(model, dataloader, optimizer, device, gene_emb, gate_rate_target, stage=0):
-    model.train()
-    total_loss = 0.0
-    all_preds, all_targets = [], []
-    loss_components = {}
-    gate_stats_sum = {}
-    delta_total = 0.0
+def train_delta(model, dataset, val_dataset, config, device, gene_emb):
+    model.freeze_baseline()
+    delta_p = [p for p in model.parameters() if p.requires_grad]
+    opt = optim.AdamW(delta_p, lr=config.get("delta_lr", 5e-5), weight_decay=config["weight_decay"])
+    best_val = float("inf")
 
-    for batch in tqdm(dataloader, desc="Training"):
-        x = batch[0].to(device)
-        pert_info = batch[1] if len(batch) > 1 and batch[1] is not None else None
-        if pert_info is not None:
+    ti, tf = config["tau_init"], config["tau_final"]
+    di, df = config["drive_noise_init"], config["drive_noise_final"]
+    ne = config["noise_epochs"]
+    bw, ow, ot, rw = config["gate_bimodal_weight"], config["open_fraction_weight"], \
+                     config["open_fraction_target"], config["r_o_couple_weight"]
+    bs = config["batch_size"]
+
+    print(f"\n{'='*60}")
+    print(f"Stage 2: Delta RL (dense, {sum(p.numel() for p in delta_p):,} trainable, bs={bs})")
+    print(f"{'='*60}")
+
+    for ep in range(config["delta_epochs"]):
+        f = min(ep / max(ne - 1, 1), 1.0)
+        tau, dns = ti*(1-f)+tf*f, di*(1-f)+df*f if ep < ne else (tf, df)
+        model.set_gate_temp(tau, dns)
+        rl = tau > tf + 0.01 or dns > df + 0.001
+
+        print(f"\nEpoch {ep+1}/{config['delta_epochs']}  [τ={tau:.3f} σ={dns:.3f}]")
+
+        model.train()
+        tl, ct = 0.0, 0
+        ct_c = {}
+        # Keep one batch on GPU for gate stats (avoids costly CPU transfer every iter)
+        last_lat = None
+        loader = dense_loader(dataset, bs, shuffle=True, seed=42 + ep)
+        for x, pert_info in tqdm(loader, desc="Delta Train", total=n_batches(len(dataset), bs)):
+            x = x.to(device)
             pert_info = {k: v.to(device) for k, v in pert_info.items()}
-
-        gene_mask = torch.bernoulli(torch.full_like(x, 0.8)).to(device)
-
-        optimizer.zero_grad()
-
-        mu, theta, latents = model(x, gene_emb=gene_emb, pert_info=pert_info,
-                                   gene_mask=gene_mask, return_latent=True)
-
-        if stage == 0:
-            # PBS pretrain: baseline only
-            loss, comps, gs = compute_loss(
-                mu, x, theta, latents['pi'], latents['o_raw'], latents['o_eff'],
-                latents['z'], latents['W'], gene_mask=gene_mask,
-                gate_rate_target=gate_rate_target)
-            preds = mu
-        else:
-            # Joint: μ_pert for all cells; delta loss pushes Δ→0 for control cells
-            mu_pert = latents['mu_pert']
-            pi_pert = latents['pi_pert']
-            o_pert = latents['o_pert']
-
-            loss, comps, gs = compute_loss(
-                mu_pert, x, theta, pi_pert, o_pert, latents['o_eff'],
-                latents['z'], latents['W'], gene_mask=gene_mask,
-                gate_rate_target=gate_rate_target)
-
-            loss_delta = delta_loss(latents['delta_mu'], x, mu)
-            loss = loss + config["delta_weight"] * loss_delta
-            delta_total += loss_delta.item()
-            preds = mu_pert
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip_value"])
-        optimizer.step()
-
-        total_loss += loss.item()
-        all_preds.append(preds.detach().cpu())
-        all_targets.append(x.cpu())
-        for k, v in comps.items():
-            loss_components[k] = loss_components.get(k, 0.0) + v
-        for k, v in gs.items():
-            if k not in ('det_pi', 'det_x', 'det_mask'):
-                gate_stats_sum[k] = gate_stats_sum.get(k, 0.0) + v
-
-    avg_loss = total_loss / len(dataloader)
-    all_preds = torch.cat(all_preds, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-    metrics = calculate_metrics(all_preds, all_targets)
-    for k in loss_components:
-        loss_components[k] /= len(dataloader)
-    for k in gate_stats_sum:
-        gate_stats_sum[k] /= len(dataloader)
-    gate_stats_sum['delta'] = delta_total / len(dataloader)
-    return avg_loss, loss_components, metrics, gate_stats_sum
-
-
-def val_epoch(model, dataloader, device, gene_emb, gate_rate_target, stage=0):
-    model.eval()
-    total_loss = 0.0
-    all_preds, all_targets = [], []
-    loss_components = {}
-    last_latents = None
-    gate_stats_sum = {}
-    delta_total = 0.0
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validation"):
-            x = batch[0].to(device)
-            pert_info = batch[1] if len(batch) > 1 and batch[1] is not None else None
-            if pert_info is not None:
-                pert_info = {k: v.to(device) for k, v in pert_info.items()}
-
-            gene_mask = torch.zeros_like(x)
-            gene_mask[:, :int(0.8 * x.shape[1])] = 1.0
-
-            mu, theta, latents = model(x, gene_emb=gene_emb, pert_info=pert_info,
-                                       gene_mask=gene_mask, return_latent=True)
-
-            if stage == 0:
-                loss, comps, gs = compute_loss(
-                    mu, x, theta, latents['pi'], latents['o_raw'], latents['o_eff'],
-                    latents['z'], latents['W'], gene_mask=gene_mask,
-                    gate_rate_target=gate_rate_target)
-                preds = mu
-            else:
-                mu_pert = latents['mu_pert']
-                pi_pert = latents['pi_pert']
-                o_pert = latents['o_pert']
-
-                loss, comps, gs = compute_loss(
-                    mu_pert, x, theta, pi_pert, o_pert, latents['o_eff'],
-                    latents['z'], latents['W'], gene_mask=gene_mask,
-                    gate_rate_target=gate_rate_target)
-
-                loss_delta = delta_loss(latents['delta_mu'], x, mu)
-                loss = loss + config["delta_weight"] * loss_delta
-                delta_total += loss_delta.item()
-                preds = mu_pert
-
-            total_loss += loss.item()
-            all_preds.append(preds.cpu())
-            all_targets.append(x.cpu())
+            opt.zero_grad()
+            mu1, dmu, lat = model(x, gene_emb, pert_info, return_latent=True, rl_training=rl)
+            loss, comps = delta_loss(mu1, x, lat['delta_pi'], dmu, pert_info['is_perturbed'],
+                                     o1=lat['o1'], r1=lat['r1'],
+                                     l1_weight=config["l1_weight"], pbs_weight=config["pbs_weight"],
+                                     gate_bimodal_weight=bw, open_fraction_target=ot,
+                                     open_fraction_weight=ow, r_o_couple_weight=rw)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(delta_p, config["grad_clip_value"])
+            opt.step()
+            tl += loss.item(); ct += 1
             for k, v in comps.items():
-                loss_components[k] = loss_components.get(k, 0.0) + v
-            for k, v in gs.items():
-                if k not in ('det_pi', 'det_x', 'det_mask'):
-                    gate_stats_sum[k] = gate_stats_sum.get(k, 0.0) + v
-            last_det = {k: gs[k] for k in ('det_pi', 'det_x', 'det_mask') if k in gs}
-            last_latents = {k: v.cpu() for k, v in latents.items()}
+                ct_c[k] = ct_c.get(k, 0.0) + v
+            last_lat = {k: v.detach() for k, v in lat.items()}
 
-    avg_loss = total_loss / len(dataloader)
-    all_preds = torch.cat(all_preds, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-    metrics = calculate_metrics(all_preds, all_targets)
-    for k in loss_components:
-        loss_components[k] /= len(dataloader)
-    for k in gate_stats_sum:
-        gate_stats_sum[k] /= len(dataloader)
-    gate_stats_sum.update(last_det)
-    gate_stats_sum['delta'] = delta_total / len(dataloader)
-    return avg_loss, loss_components, metrics, last_latents, gate_stats_sum
+        n = max(ct, 1)
 
+        model.eval()
+        vl, vt = 0.0, 0
+        cv_c = {}
+        # Val metrics accumulated on GPU in subsets to avoid full transfer
+        vp_parts, vm_parts = [], []
+        lat_sample = None
+        max_val_cat = 500000  # Keep ~500K cells for metrics (enough for stable Pearson)
+        with torch.no_grad():
+            for x, pert_info in tqdm(dense_loader(val_dataset, bs, shuffle=False),
+                                     desc="Delta Val", total=n_batches(len(val_dataset), bs)):
+                x = x.to(device)
+                pert_info = {k: v.to(device) for k, v in pert_info.items()}
+                mu1, dmu, lat = model(x, gene_emb, pert_info, return_latent=True)
+                loss, comps = delta_loss(mu1, x, lat['delta_pi'], dmu, pert_info['is_perturbed'],
+                                         o1=lat['o1'], r1=lat['r1'],
+                                         l1_weight=config["l1_weight"], pbs_weight=config["pbs_weight"],
+                                         gate_bimodal_weight=bw, open_fraction_target=ot,
+                                         open_fraction_weight=ow, r_o_couple_weight=rw)
+                vl += loss.item(); vt += 1
+                for k, v in comps.items():
+                    cv_c[k] = cv_c.get(k, 0.0) + v
+                # Subsample for metrics to keep memory bounded
+                if sum(p.shape[0] for p in vp_parts) < max_val_cat:
+                    vp_parts.append(mu1.cpu()); vm_parts.append(x.cpu())
+                lat_sample = {k: v.cpu() for k, v in lat.items()}
 
-def train_model(model, train_data, val_data, config, device, checkpoint_path,
-                gene_emb=None, train_cell_emb=None, val_cell_emb=None,
-                train_pert=None, val_pert=None):
-    use_pert = train_pert is not None
-    train_loader, val_loader = create_dataloaders(
-        train_data, val_data, train_cell_emb, val_cell_emb, train_pert, val_pert)
-    optimizer = optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
-    best_val_loss = float("inf")
+        nv = max(vt, 1)
+        val_met = calculate_metrics(torch.cat(vp_parts), torch.cat(vm_parts))
+        o = last_lat['o'].cpu(); o1 = last_lat['o1'].cpu()
+        print(f"  Train={tl/n:.4f} Val={vl/nv:.4f}")
+        print(f"  cell_r={val_met['cell_pearson']:.4f} gene_r={val_met['gene_pearson']:.4f}")
+        print(f"  Gate: c={(o<0.1).float().mean():.3f} o={(o>0.9).float().mean():.3f}")
+        print(f"  ΔGate: c={(o1<0.1).float().mean():.3f} o={(o1>0.9).float().mean():.3f}")
+        print(f"  Loss: { {k: f'{v/nv:.4f}' for k, v in cv_c.items()} }")
+        print(f"  |δπ|={last_lat['delta_pi'].abs().mean():.4f} |δμ|={last_lat.get('delta_mu',torch.zeros(1)).abs().mean():.4f}")
+        if vl/nv < best_val:
+            best_val = vl/nv
+            save_checkpoint(model, os.path.join(ROOT, "checkpoints", "hayat_delta.pt"))
+            print("  saved")
 
-    total_epochs = config["stage0_epochs"] + config["stage1_epochs"]
-
-    for epoch in range(total_epochs):
-        if epoch < config["stage0_epochs"]:
-            stage = 0
-            tau, eps, alpha_scale = get_annealing(epoch, config["stage0_epochs"])
-            stage_name = "DRIVE" if alpha_scale == 0 else ("GATE_Γu" if alpha_scale <= 0.11 else "FULL")
-        else:
-            stage = 1
-            tau, eps, alpha_scale = 0.5, 0.01, 1.0
-            stage_name = "DELTA"
-
-        model.set_annealing(tau, eps, alpha_scale)
-
-        print(f"\nEpoch {epoch + 1}/{total_epochs}  [Stage {stage}: {stage_name}]  "
-              f"τ={tau:.2f} ε={eps:.3f} α_scale={alpha_scale:.2f}")
-        train_loss, train_comp, train_metrics, train_gs = train_epoch(
-            model, train_loader, optimizer, device, gene_emb, config["gate_rate_target"], stage=stage)
-        val_loss, val_comp, val_metrics, latents, val_gs = val_epoch(
-            model, val_loader, device, gene_emb, config["gate_rate_target"], stage=stage)
-
-        # Alpha vs Gamma·u dominance
-        alpha_mean = latents['alpha'].abs().mean().item()
-        gamma_u_mean = latents['gamma_u'].abs().mean().item()
-        ratio = gamma_u_mean / (alpha_mean + 1e-8)
-        pi_var = latents['pi'].var(dim=0).mean().item()
-
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        print(f"Train Pearson: cell={train_metrics['cell_pearson']:.4f} gene={train_metrics['gene_pearson']:.4f} gene_hvg={train_metrics['gene_hvg']:.4f} gene_mid={train_metrics['gene_mid']:.4f}")
-        print(f"Val Pearson:   cell={val_metrics['cell_pearson']:.4f} gene={val_metrics['gene_pearson']:.4f} gene_hvg={val_metrics['gene_hvg']:.4f} gene_mid={val_metrics['gene_mid']:.4f}")
-        print(f"Loss: { {k: f'{v:.4f}' for k, v in val_comp.items()} }")
-        gs = val_gs
-        print(f"Gate: raw={gs['o_raw_mean']:.3f} closed={gs['p_closed']:.3f} open={gs['p_open']:.3f} mid={gs['p_mid']:.3f} gene_std={gs['o_gene_std']:.3f}")
-        if stage == 1:
-            print(f"Delta loss: {gs.get('delta', 0.0):.4f}")
-
-        try:
-            from sklearn.metrics import roc_auc_score
-            det_pi = gs.get('det_pi')
-            if det_pi is not None:
-                det_x = gs['det_x']
-                det_mask = gs['det_mask'].bool()
-                det_auc = roc_auc_score(
-                    (det_x[det_mask] > 0).float().cpu().numpy(),
-                    det_pi[det_mask].cpu().numpy(),
-                )
-                print(f"Det AUC: {det_auc:.4f} | Dominance: |α|={alpha_mean:.4f} |Γ·u|={gamma_u_mean:.4f} ratio={ratio:.3f} Var(π)={pi_var:.6f}")
-            else:
-                print(f"Dominance: |α|={alpha_mean:.4f} |Γ·u|={gamma_u_mean:.4f} ratio={ratio:.3f} Var(π)={pi_var:.6f}")
-        except Exception:
-            print(f"Dominance: |α|={alpha_mean:.4f} |Γ·u|={gamma_u_mean:.4f} ratio={ratio:.3f} Var(π)={pi_var:.6f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(model, checkpoint_path)
-            print(f"Best model saved to {checkpoint_path}")
-
-    load_checkpoint(model, checkpoint_path, device)
+    load_checkpoint(model, os.path.join(ROOT, "checkpoints", "hayat_delta.pt"), device)
     return model
 
 
 if __name__ == "__main__":
-    data_dir = os.environ.get("GENE_DATA_DIR", "../data")
-    is_schmidt = (data_dir == "Schmidt" or data_dir.endswith("Schmidt"))
-    if is_schmidt:
-        data_file = f"../{data_dir}/schmidt_data.pt"
-        gene_emb_file = f"../{data_dir}/schmidt_gene_embeddings.pt"
-        chrom_file = f"../{data_dir}/schmidt_chrom_boundaries.pt"
-        pert_file = f"../{data_dir}/schmidt_pert_labels.pt"
-    else:
-        data_file_100k = f"{data_dir}/processed_data_100k.pt"
-        if os.path.exists(data_file_100k):
-            data_file = data_file_100k
-        else:
-            data_file = f"{data_dir}/processed_data.pt"
-        gene_emb_file = f"{data_dir}/gene_embeddings.pt"
-        chrom_file = f"{data_dir}/chrom_boundaries.pt"
-        pert_file = f"{data_dir}/pert_labels.pt"
-
-    cell_emb_file = f"{data_dir}/cell_embeddings.pt"
+    import sys, gc
+    data_dir = os.environ.get("GENE_DATA_DIR", os.path.join(ROOT, "data"))
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
 
-    data = torch.load(data_file)
+    gene_emb = torch.load(os.path.join(data_dir, "gene_embeddings.pt"))
+    chrom_boundaries = torch.load(os.path.join(data_dir, "chrom_boundaries.pt"))
+    print(f"Genes: {gene_emb.shape[0]} x {gene_emb.shape[1]}  Segments: {len(chrom_boundaries)}")
 
-    if is_schmidt:
-        expr = data["expression"]
-        max_cells = config.get("max_train_cells", 0)
-        if max_cells > 0 and expr.shape[0] > max_cells:
-            expr = expr[:max_cells]
-        split = int(expr.shape[0] * 0.8)
-        rng = torch.Generator()
-        indices = torch.randperm(expr.shape[0], generator=rng)
-        train_data = expr[indices[:split]]
-        val_data = expr[indices[split:]]
+    # Resolve n_perturbations — checkpoint takes priority for shape compatibility
+    skip_pbs = "--skip-pbs" in sys.argv
+    n_pert = None
+    pbs_ckpt = os.path.join(ROOT, "checkpoints", "hayat_pbs.pt")
+    if skip_pbs and os.path.exists(pbs_ckpt):
+        n_pert = torch.load(pbs_ckpt, map_location="cpu", weights_only=True)["pert_emb.weight"].shape[0] - 1  # padding_idx=0
+    if n_pert is None:
+        n_pert = torch.load(os.path.join(data_dir, "pert_labels.pt"), weights_only=True)["n_perturbations"]
+
+    model = Hayat(chrom_boundaries=chrom_boundaries,
+                  gene_emb_dim=gene_emb.shape[1],
+                  n_perturbations=n_pert).to(device)
+    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+
+    if skip_pbs and os.path.exists(pbs_ckpt):
+        model.load_state_dict(torch.load(pbs_ckpt, map_location=device, weights_only=True))
+        print(f"[PBS] skipped — loaded {pbs_ckpt} (n_pert={n_pert})")
     else:
-        train_data = data["train"]
-        val_data = data["val"]
-        max_cells = config.get("max_train_cells", 0)
-        if max_cells > 0:
-            if train_data.shape[0] > max_cells:
-                train_data = train_data[:max_cells]
-            val_max = max(max_cells // 5, 200)
-            if val_data.shape[0] > val_max:
-                val_data = val_data[:val_max]
+        if skip_pbs:
+            print(f"[PBS] checkpoint not found at {pbs_ckpt}, running PBS...")
 
-    # ── Gene embeddings (required: scGPT gene token embeddings) ──
-    if os.path.exists(gene_emb_file):
-        gene_emb = torch.load(gene_emb_file)
-        gene_emb_dim = gene_emb.shape[1]
-        print(f"Gene embeddings: {gene_emb.shape[0]} genes × {gene_emb_dim} dim")
-    else:
-        raise FileNotFoundError(f"Gene embeddings required: {gene_emb_file}")
+        opt = optim.AdamW(model.parameters(), lr=config["learning_rate"],
+                          weight_decay=config["weight_decay"])
+        pbs_train = DenseDataset(os.path.join(data_dir, "dense_pbs.pt"),
+                                 os.path.join(data_dir, "dense_pbs_pert.pt"))
+        pbs_val = DenseDataset(os.path.join(data_dir, "dense_pbs_val.pt"),
+                               os.path.join(data_dir, "dense_pbs_val_pert.pt"))
+        print(f"PBS train: {len(pbs_train):,}  PBS val: {len(pbs_val):,}")
+        train_pbs(model, pbs_train, pbs_val, config, device, opt, gene_emb)
+        del pbs_train, pbs_val
 
-    # ── Cell embeddings (optional: pre-computed scGPT cell embeddings) ──
-    train_cell_emb, val_cell_emb, cell_emb_dim = None, None, 0
-    if os.path.exists(cell_emb_file):
-        cell_data = torch.load(cell_emb_file)
-        if (cell_data["train_emb"].shape[0] >= train_data.shape[0] and
-            cell_data["val_emb"].shape[0] >= val_data.shape[0]):
-            train_cell_emb = cell_data["train_emb"][:train_data.shape[0]]
-            val_cell_emb = cell_data["val_emb"][:val_data.shape[0]]
-            cell_emb_dim = cell_data["embed_dim"]
-            print(f"Cell embeddings: {cell_emb_dim}-dim")
-        else:
-            print(f"Cell embeddings too small ({cell_data['train_emb'].shape[0]}), skipping")
+    gc.collect()
+    if device.type == "mps":
+        torch.mps.empty_cache()
 
-    # ── Perturbation labels (optional: cytokine/dose/time per cell) ──
-    train_pert, val_pert, pert_meta = None, None, {}
-    if os.path.exists(pert_file):
-        pert_data = torch.load(pert_file)
-        if is_schmidt:
-            n_cells = expr.shape[0]
-            split_pert = {k: v[indices] for k, v in pert_data.items() if isinstance(v, torch.Tensor)}
-            train_pert = {k: v[:split] for k, v in split_pert.items()}
-            val_pert = {k: v[split:] for k, v in split_pert.items()}
-        else:
-            train_pert = pert_data.get("train_pert", pert_data.get("pert_labels"))
-            val_pert = pert_data.get("val_pert", {})
-            if train_pert is not None:
-                for k in train_pert:
-                    train_pert[k] = train_pert[k][:train_data.shape[0]]
-                for k in val_pert:
-                    val_pert[k] = val_pert[k][:val_data.shape[0]]
-        pert_meta = {
-            'n_cytokines': pert_data.get('n_cytokines', 100),
-            'n_doses': pert_data.get('n_doses', 10),
-            'n_times': pert_data.get('n_times', 10),
-        }
-        print(f"Perturbation labels: {len(train_pert)} keys, "
-              f"n_cytokines={pert_meta['n_cytokines']}")
-
-    chrom_boundaries = torch.load(chrom_file)
-
-    print(f"Training: {train_data.shape[0]} cells × {train_data.shape[1]} genes")
-    print(f"Segments: {len(chrom_boundaries)}")
-
-    model = Hayat(
-        chrom_boundaries=chrom_boundaries,
-        gene_emb_dim=gene_emb_dim,
-        cell_emb_dim=cell_emb_dim,
-        n_cytokines=pert_meta.get('n_cytokines', 100),
-        n_doses=pert_meta.get('n_doses', 10),
-        n_times=pert_meta.get('n_times', 10),
-    ).to(device)
-
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {total:,} total | {trainable:,} trainable | "
-          f"{total * 4 / 1024 / 1024:.1f} MB")
-
-    ckpt_name = f"hayat_{data_dir.replace('/', '_')}.pt"
-    ckpt_path = f"../checkpoints/{ckpt_name}"
-
-    train_model(model, train_data, val_data, config, device=device, checkpoint_path=ckpt_path,
-                gene_emb=gene_emb, train_cell_emb=train_cell_emb, val_cell_emb=val_cell_emb,
-                train_pert=train_pert, val_pert=val_pert)
+    # Stage 2: Delta — load train into RAM as float16 (73GB fits in 128GB unified)
+    print("Loading train into RAM (float16, ~73GB)...")
+    train_ds = DenseDataset(os.path.join(data_dir, "dense_train.pt"),
+                            os.path.join(data_dir, "dense_train_pert.pt"), mmap=False)
+    val_ds = DenseDataset(os.path.join(data_dir, "dense_val.pt"),
+                          os.path.join(data_dir, "dense_val_pert.pt"))
+    print(f"Delta train: {len(train_ds):,}  val: {len(val_ds):,}")
+    train_delta(model, train_ds, val_ds, config, device, gene_emb)
